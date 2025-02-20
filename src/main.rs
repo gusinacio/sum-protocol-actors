@@ -47,7 +47,8 @@ impl ActorMessage<Evaluate> for Oracle {
 
 #[derive(Actor)]
 struct Verifier {
-    polynomial: MultiPoly,
+    polynomial_degree: usize,
+    polynomial_num_vars: usize,
     last_val: Fq,
     point: Vec<Fq>,
 
@@ -58,12 +59,15 @@ struct Verifier {
 impl Verifier {
     pub fn new(polynomial: MultiPoly, h: Fq) -> Self {
         let random_generator = kameo::spawn(RandomGenerator);
-        let oracle = kameo::spawn(Oracle::new(polynomial.clone()));
+        let polynomial_num_vars = polynomial.num_vars();
+        let polynomial_degree = polynomial.degree();
+        let oracle = kameo::spawn(Oracle::new(polynomial));
         Self {
             random_generator,
             last_val: h,
             oracle,
-            polynomial,
+            polynomial_num_vars,
+            polynomial_degree,
             point: vec![],
         }
     }
@@ -105,7 +109,7 @@ impl ActorMessage<Proof> for Verifier {
         // We don't need to check for variables because the typesystem assures there's only 1 variable
 
         // TODO maybe I need to check the degree of the variable instead of degree of the polynomial
-        if polynomial_g.degree() > self.polynomial.degree() {
+        if polynomial_g.degree() > self.polynomial_degree {
             return VerificationStatus::Reject(VerificationError::DegreeTooBig);
         }
         let g_0 = polynomial_g.evaluate(&Fq::zero());
@@ -132,7 +136,7 @@ impl ActorMessage<Proof> for Verifier {
             self.last_val
         );
         println!("[Verifier] Point[] = {:?}", self.point);
-        if self.point.len() == self.polynomial.num_vars() {
+        if self.point.len() == self.polynomial_num_vars {
             let Evaluation(eval) = self.oracle.ask(Evaluate(self.point.clone())).await.unwrap();
             if eval == polynomial_g.evaluate(&random_point) {
                 VerificationStatus::Accept
