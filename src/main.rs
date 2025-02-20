@@ -49,18 +49,27 @@ impl ActorMessage<Evaluate> for Oracle {
 struct Verifier {
     polynomial: MultiPoly,
     last_val: Fq,
-    oracle: ActorRef<Oracle>,
     point: Vec<Fq>,
+
+    oracle: ActorRef<Oracle>,
+    random_generator: ActorRef<RandomGenerator>,
 }
 
 impl Verifier {
     pub fn new(polynomial: MultiPoly, h: Fq, oracle: ActorRef<Oracle>) -> Self {
+        let random_generator = kameo::spawn(RandomGenerator);
         Self {
+            random_generator,
             last_val: h,
             oracle,
             polynomial,
             point: vec![],
         }
+    }
+
+    async fn generate_random_number(&self) -> Fq {
+        let RandomNumber(random_point) = self.random_generator.ask(GenerateNumber).await.unwrap();
+        random_point
     }
 }
 
@@ -112,11 +121,8 @@ impl ActorMessage<Proof> for Verifier {
             });
         }
 
-        let random_point = {
-            let mut rng = ark_std::rand::thread_rng();
-            // return a challenge
-            Fq::rand(&mut rng)
-        };
+        // generate a random point
+        let random_point = self.generate_random_number().await;
 
         println!("[Verifier] Random point = {}", random_point);
         self.last_val = polynomial_g.evaluate(&random_point);
@@ -136,6 +142,28 @@ impl ActorMessage<Proof> for Verifier {
         } else {
             VerificationStatus::Challenge(random_point)
         }
+    }
+}
+
+#[derive(Actor)]
+struct RandomGenerator;
+
+struct GenerateNumber;
+
+#[derive(Reply)]
+struct RandomNumber(Fq);
+
+impl ActorMessage<GenerateNumber> for RandomGenerator {
+    type Reply = RandomNumber;
+
+    async fn handle(
+        &mut self,
+        _: GenerateNumber,
+        _: Context<'_, Self, Self::Reply>,
+    ) -> Self::Reply {
+        let mut rng = ark_std::rand::thread_rng();
+        // return a challenge
+        RandomNumber(Fq::rand(&mut rng))
     }
 }
 
