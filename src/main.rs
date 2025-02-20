@@ -4,6 +4,7 @@ use ark_poly::{
     univariate::DensePolynomial as UniPoly,
     DenseMVPolynomial, DenseUVPolynomial, Polynomial,
 };
+use ark_serialize::CanonicalSerialize;
 use itertools::Itertools;
 use kameo::{
     actor::ActorRef,
@@ -13,8 +14,10 @@ use kameo::{
 
 mod polynomial;
 mod scalar;
+mod transcript;
 
 use scalar::Fq;
+use transcript::Transcript;
 
 type MultiPoly = SparseMultilinearPolynomial<Fq, SparseTerm>;
 
@@ -46,19 +49,22 @@ impl ActorMessage<Evaluate> for Oracle {
 }
 
 #[derive(Actor)]
-struct Verifier {
+struct Verifier<T: Actor> {
     polynomial_degree: usize,
     polynomial_num_vars: usize,
     last_val: Fq,
     point: Vec<Fq>,
 
     oracle: ActorRef<Oracle>,
-    random_generator: ActorRef<RandomGenerator>,
+    random_generator: ActorRef<T>,
 }
 
-impl Verifier {
-    pub fn new(polynomial: MultiPoly, h: Fq) -> Self {
-        let random_generator = kameo::spawn(RandomGenerator);
+impl<T> Verifier<T>
+where
+    // any actor that returns a random number
+    T: Actor + ActorMessage<GenerateNumber, Reply = RandomNumber>,
+{
+    pub fn new(polynomial: MultiPoly, h: Fq, random_generator: ActorRef<T>) -> Self {
         let polynomial_num_vars = polynomial.num_vars();
         let polynomial_degree = polynomial.degree();
         let oracle = kameo::spawn(Oracle::new(polynomial));
@@ -78,7 +84,7 @@ impl Verifier {
     }
 }
 
-#[derive(Reply)]
+#[derive(Clone, Debug, Reply, CanonicalSerialize)]
 struct Proof(UniPoly<Fq>);
 
 #[derive(thiserror::Error, Debug)]
@@ -98,7 +104,10 @@ enum VerificationStatus {
     Challenge(Fq),
 }
 
-impl ActorMessage<Proof> for Verifier {
+impl<T> ActorMessage<Proof> for Verifier<T>
+where
+    T: Actor + ActorMessage<GenerateNumber, Reply = RandomNumber>,
+{
     type Reply = VerificationStatus;
 
     async fn handle(
@@ -152,10 +161,45 @@ impl ActorMessage<Proof> for Verifier {
 #[derive(Actor)]
 struct RandomGenerator;
 
+#[derive(Actor, Default)]
+struct FiatShamirGenerator {
+    transcript: Transcript,
+}
+
 struct GenerateNumber;
+
+struct UpdateTranscript<M> {
+    msg: M,
+}
 
 #[derive(Reply)]
 struct RandomNumber(Fq);
+
+impl<M: CanonicalSerialize + Send + 'static> ActorMessage<UpdateTranscript<M>>
+    for FiatShamirGenerator
+{
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        UpdateTranscript { msg }: UpdateTranscript<M>,
+        _: Context<'_, Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.transcript.append_transcript(&msg);
+    }
+}
+
+impl ActorMessage<GenerateNumber> for FiatShamirGenerator {
+    type Reply = RandomNumber;
+
+    async fn handle(
+        &mut self,
+        _: GenerateNumber,
+        _: Context<'_, Self, Self::Reply>,
+    ) -> Self::Reply {
+        RandomNumber(self.transcript.challenge())
+    }
+}
 
 impl ActorMessage<GenerateNumber> for RandomGenerator {
     type Reply = RandomNumber;
@@ -189,7 +233,7 @@ impl Prover {
 /// initial step
 struct RequestProof;
 impl ActorMessage<RequestProof> for Prover {
-    type Reply = Proof;
+    type Reply = ProofStatus;
 
     async fn handle(
         &mut self,
@@ -197,7 +241,7 @@ impl ActorMessage<RequestProof> for Prover {
         _ctx: Context<'_, Self, Self::Reply>,
     ) -> Self::Reply {
         let polynomial = gen_uni_polynomial(&self.polynomial, &[None]);
-        Proof(polynomial)
+        ProofStatus::WaitingForChallenge(Proof(polynomial))
     }
 }
 
@@ -236,10 +280,38 @@ struct Challenge {
     point: Fq,
 }
 
-#[derive(Reply)]
+#[derive(Clone, Debug, Reply)]
 enum ProofStatus {
     WaitingForChallenge(Proof),
     FinalProof(Proof),
+}
+
+impl ProofStatus {
+    fn proof(self) -> Proof {
+        match self {
+            ProofStatus::WaitingForChallenge(proof) | ProofStatus::FinalProof(proof) => proof,
+        }
+    }
+}
+
+impl CanonicalSerialize for ProofStatus {
+    fn serialize_with_mode<W: std::io::Write>(
+        &self,
+        writer: W,
+        compress: ark_serialize::Compress,
+    ) -> Result<(), ark_serialize::SerializationError> {
+        match self {
+            ProofStatus::WaitingForChallenge(proof) => proof.serialize_with_mode(writer, compress),
+            ProofStatus::FinalProof(proof) => proof.serialize_with_mode(writer, compress),
+        }
+    }
+
+    fn serialized_size(&self, compress: ark_serialize::Compress) -> usize {
+        match self {
+            ProofStatus::WaitingForChallenge(proof) => proof.serialized_size(compress),
+            ProofStatus::FinalProof(proof) => proof.serialized_size(compress),
+        }
+    }
 }
 
 impl ActorMessage<Challenge> for Prover {
@@ -292,15 +364,22 @@ async fn main() {
 
     let h = sum_poly(&polynomial);
 
+    use_interactive_sum_check(polynomial.clone(), h).await;
+    use_fiat_shamir_sum_check(polynomial, h).await;
+}
+
+async fn use_interactive_sum_check(polynomial: MultiPoly, h: Fq) {
     let prover = Prover::new(polynomial.clone());
     let prover = kameo::spawn(prover);
 
-    let verifier = Verifier::new(polynomial, h);
+    let random_generator = kameo::spawn(RandomGenerator);
+
+    let verifier = Verifier::new(polynomial, h, random_generator.clone());
     let verifier = kameo::spawn(verifier);
 
     let mut proof = prover.ask(RequestProof).await.unwrap();
     loop {
-        match verifier.ask(proof).await.unwrap() {
+        match verifier.ask(proof.proof()).await.unwrap() {
             VerificationStatus::Accept => {
                 println!("Accepted!");
                 break;
@@ -310,12 +389,56 @@ async fn main() {
                 break;
             }
             VerificationStatus::Challenge(fp) => {
-                proof = match prover.ask(Challenge { point: fp }).await.unwrap() {
-                    ProofStatus::WaitingForChallenge(proof) | ProofStatus::FinalProof(proof) => {
-                        proof
-                    }
-                }
+                proof = prover.ask(Challenge { point: fp }).await.unwrap();
             }
+        }
+    }
+}
+
+async fn use_fiat_shamir_sum_check(polynomial: MultiPoly, h: Fq) {
+    let prover = Prover::new(polynomial.clone());
+    let prover = kameo::spawn(prover);
+
+    let proof = prover.ask(RequestProof).await.unwrap();
+
+    let mut messages = Vec::new();
+    let mut transcript = Transcript::default();
+
+    transcript.append_transcript(&proof);
+    messages.push(proof);
+
+    // generate proof
+    let mut is_final = false;
+    while !is_final {
+        let point = transcript.challenge();
+        let message = prover.ask(Challenge { point }).await.unwrap();
+        is_final = matches!(message, ProofStatus::FinalProof(_));
+        transcript.append_transcript(&message);
+        messages.push(message);
+    }
+    println!("[Main] Transcript: {:?}", messages);
+
+    let random_generator = kameo::spawn(FiatShamirGenerator::default());
+
+    let verifier = Verifier::new(polynomial, h, random_generator.clone());
+    let verifier = kameo::spawn(verifier);
+
+    for msg in messages {
+        random_generator
+            .tell(UpdateTranscript { msg: msg.clone() })
+            .await
+            .unwrap();
+
+        match verifier.ask(msg.proof()).await.unwrap() {
+            VerificationStatus::Accept => {
+                println!("Accepted!");
+                break;
+            }
+            VerificationStatus::Reject(verification_error) => {
+                println!("Error! {verification_error:?}");
+                break;
+            }
+            VerificationStatus::Challenge(_) => {}
         }
     }
 }
