@@ -56,8 +56,9 @@ struct Verifier {
 }
 
 impl Verifier {
-    pub fn new(polynomial: MultiPoly, h: Fq, oracle: ActorRef<Oracle>) -> Self {
+    pub fn new(polynomial: MultiPoly, h: Fq) -> Self {
         let random_generator = kameo::spawn(RandomGenerator);
+        let oracle = kameo::spawn(Oracle::new(polynomial.clone()));
         Self {
             random_generator,
             last_val: h,
@@ -101,10 +102,9 @@ impl ActorMessage<Proof> for Verifier {
         Proof(polynomial_g): Proof,
         _ctx: Context<'_, Self, Self::Reply>,
     ) -> Self::Reply {
-        // We don't need to check for variables because the typesystem assure it's only 1 variable
+        // We don't need to check for variables because the typesystem assures there's only 1 variable
 
-        // TODO maybe I need to check the degree of the variable instead of degree of the
-        // polynomial
+        // TODO maybe I need to check the degree of the variable instead of degree of the polynomial
         if polynomial_g.degree() > self.polynomial.degree() {
             return VerificationStatus::Reject(VerificationError::DegreeTooBig);
         }
@@ -232,24 +232,30 @@ struct Challenge {
     point: Fq,
 }
 
+#[derive(Reply)]
+enum ProofStatus {
+    WaitingForChallenge(Proof),
+    FinalProof(Proof),
+}
+
 impl ActorMessage<Challenge> for Prover {
-    type Reply = Proof;
+    type Reply = ProofStatus;
 
     async fn handle(
         &mut self,
         Challenge { point }: Challenge,
         _ctx: Context<'_, Self, Self::Reply>,
     ) -> Self::Reply {
+        // TODO there's a better way to generate this
         self.point.push(point);
         let mut inputs: Vec<Option<Fq>> = self.point.iter().map(|&x| Some(x)).collect();
         inputs.push(None);
-        let max_rounds = self.polynomial.num_vars;
-        let polynomial = match inputs.len() {
-            i if i == max_rounds => partial_eval(&self.polynomial, &inputs),
-            _ => gen_uni_polynomial(&self.polynomial, &inputs),
-        };
 
-        Proof(polynomial)
+        if self.polynomial.num_vars == inputs.len() {
+            ProofStatus::FinalProof(Proof(partial_eval(&self.polynomial, &inputs)))
+        } else {
+            ProofStatus::WaitingForChallenge(Proof(gen_uni_polynomial(&self.polynomial, &inputs)))
+        }
     }
 }
 
@@ -283,12 +289,11 @@ async fn main() {
     let h = sum_poly(&polynomial);
 
     let prover = Prover::new(polynomial.clone());
-
     let prover = kameo::spawn(prover);
-    let oracle = Oracle::new(polynomial.clone());
-    let oracle = kameo::spawn(oracle);
-    let verifier = Verifier::new(polynomial, h, oracle);
+
+    let verifier = Verifier::new(polynomial, h);
     let verifier = kameo::spawn(verifier);
+
     let mut proof = prover.ask(RequestProof).await.unwrap();
     loop {
         match verifier.ask(proof).await.unwrap() {
@@ -301,7 +306,11 @@ async fn main() {
                 break;
             }
             VerificationStatus::Challenge(fp) => {
-                proof = prover.ask(Challenge { point: fp }).await.unwrap();
+                proof = match prover.ask(Challenge { point: fp }).await.unwrap() {
+                    ProofStatus::WaitingForChallenge(proof) | ProofStatus::FinalProof(proof) => {
+                        proof
+                    }
+                }
             }
         }
     }
