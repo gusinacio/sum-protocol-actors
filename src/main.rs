@@ -12,6 +12,7 @@ use kameo::{
     Actor, Reply,
 };
 
+mod interactive;
 mod polynomial;
 mod scalar;
 mod transcript;
