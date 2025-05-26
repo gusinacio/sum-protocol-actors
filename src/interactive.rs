@@ -13,7 +13,7 @@ pub trait Prover {
     fn handle(&mut self, msg: &Self::Challenge) -> (Self::Message, ProofStatus);
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum ProofStatus {
     WaitingChallenge,
     Final,
@@ -99,8 +99,7 @@ impl<P, V, R> InteractiveProof<P, V, R> {
 impl<P, V, R> InteractiveProof<P, V, R>
 where
     P: Prover,
-    V: Verifier<R, Message = P::Message, Challenge = P::Challenge>,
-    R: RandomGenerator<Message = P::Message>,
+    R: RandomGenerator<Output = P::Challenge, Message = P::Message>,
 {
     /// Execute proof and verify at the same time
     pub fn create_proof(mut self) -> Vec<P::Message> {
@@ -109,45 +108,51 @@ where
         let mut status = ProofStatus::WaitingChallenge;
         loop {
             self.random_generator.update_script(&msg);
+            proof.push(msg);
             let challenge = match status {
-                ProofStatus::Final => {
-                    match self
-                        .verifier
-                        .handle_full(&msg, &mut self.random_generator, status)
-                    {
-                        VerificationStatus::Accept => {
-                            proof.push(msg);
-                            break;
-                        }
-                        VerificationStatus::Reject(_) => {
-                            panic!("Verifier rejected while prover was waiting for challenge")
-                        }
-                        VerificationStatus::Challenge(_) => {
-                            panic!("Verifier rejected while prover was waiting for challenge")
-                        }
-                    }
+                ProofStatus::WaitingChallenge => self.random_generator.generate_number(),
+                ProofStatus::Final => break,
+            };
+            (msg, status) = self.prover.handle(&challenge);
+        }
+
+        proof
+    }
+}
+
+impl<P, V, R> InteractiveProof<P, V, R>
+where
+    P: Prover,
+    V: Verifier<R, Message = P::Message, Challenge = P::Challenge>,
+    R: RandomGenerator<Message = P::Message>,
+{
+    /// Execute proof and verify at the same time
+    pub fn execute_proof(mut self) -> Vec<P::Message> {
+        let mut proof = vec![];
+        let mut msg = self.prover.init();
+        let mut status = ProofStatus::WaitingChallenge;
+        loop {
+            self.random_generator.update_script(&msg);
+            let response = self
+                .verifier
+                .handle_full(&msg, &mut self.random_generator, status);
+            proof.push(msg);
+            let challenge = match (status, response) {
+                (ProofStatus::Final, VerificationStatus::Accept) => break,
+                (ProofStatus::WaitingChallenge, VerificationStatus::Challenge(challenge)) => {
+                    challenge
                 }
-                ProofStatus::WaitingChallenge => {
-                    match self
-                        .verifier
-                        .handle_full(&msg, &mut self.random_generator, status)
-                    {
-                        VerificationStatus::Accept => {
-                            panic!("Verifier accepted while prover was waiting for challenge")
-                        }
-                        VerificationStatus::Reject(_) => {
-                            panic!("Verifier rejected while prover was waiting for challenge")
-                        }
-                        VerificationStatus::Challenge(challenge) => {
-                            proof.push(msg);
-                            challenge
-                        }
-                    }
+                (_, VerificationStatus::Reject(_)) => {
+                    panic!("Verifier rejected while prover was waiting for challenge")
+                }
+                (ProofStatus::Final, VerificationStatus::Challenge(_)) => {
+                    panic!("Verifier returned a challenge while prover has finished")
+                }
+                (ProofStatus::WaitingChallenge, VerificationStatus::Accept) => {
+                    panic!("Verifier accepted while prover was waiting for challenge")
                 }
             };
-            let (new_msg, new_status) = self.prover.handle(&challenge);
-            msg = new_msg;
-            status = new_status;
+            (msg, status) = self.prover.handle(&challenge);
         }
 
         proof
@@ -191,7 +196,7 @@ mod tests {
         DenseMVPolynomial, Polynomial,
     };
 
-    use crate::{scalar::Fq, sum_poly, FiatShamirGenerator, MultiPoly, Oracle, RandomGenerator};
+    use crate::{scalar::Fq, sum_poly, FiatShamirGenerator, MultiPoly, Oracle};
 
     use super::{
         sum_check::{SumCheckProver, SumCheckVerifier},
@@ -229,7 +234,7 @@ mod tests {
                 h,
             ))
             .with_random_generator(FiatShamirGenerator::default());
-        let proof = protocol.create_proof();
+        let proof = protocol.execute_proof();
 
         let oracle = Oracle::new(polynomial.clone());
         let protocol = InteractiveProof::new()
