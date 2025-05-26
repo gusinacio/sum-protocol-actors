@@ -442,3 +442,78 @@ async fn use_fiat_shamir_sum_check(polynomial: MultiPoly, h: Fq) {
         }
     }
 }
+
+#[cfg(test)]
+mod test {
+    use ark_std::One;
+
+    use super::*;
+
+    #[test]
+    fn test_expand_polynomial() {
+        let num_vars = 4;
+
+        // Factor 1: (1 - x1)
+        let terms = vec![
+            (Fq::one(), SparseTerm::new(vec![])),
+            (-Fq::one(), SparseTerm::new(vec![(0, 1)])),
+        ];
+        let poly1 = SparseMultilinearPolynomial::from_coefficients_vec(num_vars, terms);
+
+        // Factor 2: x2
+
+        let terms = vec![(Fq::one(), SparseTerm::new(vec![(1, 1)]))];
+        let poly2 = SparseMultilinearPolynomial::from_coefficients_vec(num_vars, terms);
+
+        // Factor 3: ( (x3 + x4) - (x3 * x4) )
+        let terms = vec![
+            (Fq::one(), SparseTerm::new(vec![(2, 1)])),
+            (Fq::one(), SparseTerm::new(vec![(3, 1)])),
+            (-Fq::one(), SparseTerm::new(vec![(2, 1), (3, 1)])),
+        ];
+        let poly3 = SparseMultilinearPolynomial::from_coefficients_vec(num_vars, terms);
+
+        // Multiply the factors sequentially.
+        // Multiplying poly1 and poly2 gives an intermediate result,
+        // and then multiplying that result with poly3 expands the entire product.
+        let poly_temp = naive_mul(&poly1, &poly2);
+        let poly_expanded = naive_mul(&poly_temp, &poly3);
+
+        // Print the expanded polynomial.
+        println!("Expanded polynomial: {:?}", poly_expanded);
+
+        let polynomial = MultiPoly::from_coefficients_vec(
+            4,
+            vec![
+                (Fq::from(-1), SparseTerm::new(vec![(0, 1), (1, 1), (2, 1)])),
+                (Fq::from(-1), SparseTerm::new(vec![(0, 1), (1, 1), (3, 1)])),
+                (
+                    Fq::from(1),
+                    SparseTerm::new(vec![(0, 1), (1, 1), (2, 1), (3, 1)]),
+                ),
+                (Fq::from(1), SparseTerm::new(vec![(1, 1), (2, 1)])),
+                (Fq::from(1), SparseTerm::new(vec![(1, 1), (3, 1)])),
+                (Fq::from(-1), SparseTerm::new(vec![(1, 1), (2, 1), (3, 1)])),
+            ],
+        );
+
+        println!("My test: {:?}", polynomial);
+        assert_eq!(poly_expanded, polynomial)
+    }
+
+    fn naive_mul(cur: &MultiPoly, other: &MultiPoly) -> MultiPoly {
+        if cur.is_zero() || other.is_zero() {
+            MultiPoly::zero()
+        } else {
+            let mut result_terms = Vec::new();
+            for (cur_coeff, cur_term) in &cur.terms {
+                for (other_coeff, other_term) in &other.terms {
+                    let mut term = cur_term.iter().cloned().collect::<Vec<_>>();
+                    term.extend(other_term.iter().cloned());
+                    result_terms.push((*cur_coeff * *other_coeff, SparseTerm::new(term)));
+                }
+            }
+            MultiPoly::from_coefficients_slice(cur.num_vars, result_terms.as_slice())
+        }
+    }
+}
