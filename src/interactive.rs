@@ -223,20 +223,13 @@ mod tests {
 
         let polynomial_num_vars = polynomial.num_vars();
         let polynomial_degree = polynomial.degree();
-        let oracle = Oracle::new(polynomial.clone());
 
         let protocol = InteractiveProof::new()
             .with_prover(SumCheckProver::new(polynomial.clone()))
-            .with_verifier(SumCheckVerifier::new(
-                polynomial_degree,
-                polynomial_num_vars,
-                oracle,
-                h,
-            ))
             .with_random_generator(FiatShamirGenerator::default());
-        let proof = protocol.execute_proof();
+        let proof = protocol.create_proof();
 
-        let oracle = Oracle::new(polynomial.clone());
+        let oracle = Oracle::new(polynomial);
         let protocol = InteractiveProof::new()
             .with_verifier(SumCheckVerifier::new(
                 polynomial_degree,

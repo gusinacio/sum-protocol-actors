@@ -4,7 +4,7 @@ use tracing::Level;
 
 use crate::{
     gen_uni_polynomial, partial_eval, scalar::Fq, Challenge, MultiPoly, Oracle, Proof,
-    RandomNumber, VerificationError,
+    VerificationError,
 };
 
 use super::{ProofStatus, Prover, VerificationStatus, Verifier};
@@ -90,7 +90,7 @@ impl SumCheckVerifier {
 
 impl<T> Verifier<T> for SumCheckVerifier
 where
-    T: RandomGenerator<Output = Fq>,
+    T: RandomGenerator<Output = Challenge>,
 {
     type Challenge = Challenge;
     type Message = Proof;
@@ -122,7 +122,9 @@ where
         }
 
         // generate a random point
-        let random_point = random_generator.generate_number();
+        let Challenge {
+            point: random_point,
+        } = random_generator.generate_number();
 
         tracing::info!(%random_point, "Generate random point");
         self.last_val = polynomial_g.evaluate(&random_point);
@@ -164,10 +166,12 @@ impl RandomGenerator for crate::RandomGenerator {
 }
 
 impl RandomGenerator for crate::FiatShamirGenerator {
-    type Output = Fq;
+    type Output = Challenge;
     type Message = Proof;
-    fn generate_number(&mut self) -> Fq {
-        self.transcript.challenge()
+    fn generate_number(&mut self) -> Challenge {
+        Challenge {
+            point: self.transcript.challenge(),
+        }
     }
 
     fn update_script(&mut self, msg: &Self::Message) {
