@@ -5,6 +5,7 @@ use ark_poly::{
     DenseMVPolynomial, DenseUVPolynomial, Polynomial,
 };
 use ark_serialize::CanonicalSerialize;
+use ark_std::rand::{rngs::StdRng, SeedableRng};
 use itertools::Itertools;
 use kameo::{
     actor::ActorRef,
@@ -12,7 +13,7 @@ use kameo::{
     Actor, Reply,
 };
 
-mod interactive;
+pub mod interactive;
 mod polynomial;
 mod scalar;
 mod transcript;
@@ -23,13 +24,17 @@ use transcript::Transcript;
 type MultiPoly = SparseMultilinearPolynomial<Fq, SparseTerm>;
 
 #[derive(Actor)]
-struct Oracle {
+pub struct Oracle {
     polynomial: MultiPoly,
 }
 
 impl Oracle {
     pub fn new(polynomial: MultiPoly) -> Self {
         Self { polynomial }
+    }
+
+    fn evaluate(&self, point: &Vec<Fq>) -> Fq {
+        self.polynomial.evaluate(point)
     }
 }
 
@@ -45,7 +50,7 @@ impl ActorMessage<Evaluate> for Oracle {
         Evaluate(point): Evaluate,
         _ctx: Context<'_, Self, Self::Reply>,
     ) -> Self::Reply {
-        Evaluation(self.polynomial.evaluate(&point))
+        Evaluation(self.evaluate(&point))
     }
 }
 
@@ -86,10 +91,10 @@ where
 }
 
 #[derive(Clone, Debug, Reply, CanonicalSerialize)]
-struct Proof(UniPoly<Fq>);
+pub struct Proof(UniPoly<Fq>);
 
 #[derive(thiserror::Error, Debug)]
-enum VerificationError {
+pub enum VerificationError {
     #[error("Degree is too big")]
     DegreeTooBig,
     #[error("Sum is not equal. g_0: {g_0}, g_1: {g_1}, h: {h}")]
@@ -160,7 +165,17 @@ where
 }
 
 #[derive(Actor)]
-struct RandomGenerator;
+struct RandomGenerator {
+    rng: StdRng,
+}
+
+impl RandomGenerator {
+    pub fn with_seed(seed: u64) -> Self {
+        Self {
+            rng: StdRng::seed_from_u64(seed),
+        }
+    }
+}
 
 #[derive(Actor, Default)]
 struct FiatShamirGenerator {
@@ -174,7 +189,7 @@ struct UpdateTranscript<M> {
 }
 
 #[derive(Reply)]
-struct RandomNumber(Fq);
+pub struct RandomNumber(Fq);
 
 impl<M: CanonicalSerialize + Send + 'static> ActorMessage<UpdateTranscript<M>>
     for FiatShamirGenerator
@@ -277,7 +292,7 @@ fn gen_uni_polynomial(poly: &MultiPoly, inputs: &[Option<Fq>]) -> UniPoly<Fq> {
         .fold(UniPoly::zero(), |acc, vals| acc + partial_eval(poly, &vals))
 }
 
-struct Challenge {
+pub struct Challenge {
     point: Fq,
 }
 
@@ -373,7 +388,7 @@ async fn use_interactive_sum_check(polynomial: MultiPoly, h: Fq) {
     let prover = Prover::new(polynomial.clone());
     let prover = kameo::spawn(prover);
 
-    let random_generator = kameo::spawn(RandomGenerator);
+    let random_generator = kameo::spawn(RandomGenerator::with_seed(1));
 
     let verifier = Verifier::new(polynomial, h, random_generator.clone());
     let verifier = kameo::spawn(verifier);

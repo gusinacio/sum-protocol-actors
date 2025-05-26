@@ -13,3 +13,5 @@ kameo = "0.14.0"
 sha3 = "0.10.8"
 thiserror = "2.0.12"
 tokio = { version = "1.45.1", features = ["full"] }
+tracing = "0.1.41"
+test-log = { version = "0.2.17", features = ["trace"] }

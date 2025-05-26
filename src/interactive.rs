@@ -1,3 +1,9 @@
+use std::fmt::Debug;
+
+use sum_check::RandomGenerator;
+
+pub mod sum_check;
+
 pub trait Prover {
     type Challenge;
     type Message;
@@ -20,60 +26,81 @@ pub enum VerificationStatus<T, E> {
     Challenge(T),
 }
 
-pub trait Verifier {
+pub trait Verifier<T> {
     type Challenge;
     type Message;
+    type Error;
 
     fn handle_full(
         &mut self,
         msg: &Self::Message,
+        generator: &mut T,
         _proof_status: ProofStatus,
-    ) -> VerificationStatus<Self::Challenge, ()> {
-        self.handle(msg)
+    ) -> VerificationStatus<Self::Challenge, Self::Error> {
+        self.handle(msg, generator)
     }
-
-    fn handle(&mut self, msg: &Self::Message) -> VerificationStatus<Self::Challenge, ()>;
+    fn handle(
+        &mut self,
+        msg: &Self::Message,
+        generator: &mut T,
+    ) -> VerificationStatus<Self::Challenge, Self::Error>;
 }
 
 pub struct NoProver;
 pub struct NoVerifier;
+pub struct NoRandomGenerator;
 
-pub struct InteractiveProof<P, V> {
+pub struct InteractiveProof<P, V, R> {
     prover: P,
     verifier: V,
+    random_generator: R,
 }
 
-impl InteractiveProof<NoProver, NoVerifier> {
+impl InteractiveProof<NoProver, NoVerifier, NoRandomGenerator> {
     pub fn new() -> Self {
         InteractiveProof {
             prover: NoProver,
             verifier: NoVerifier,
+            random_generator: NoRandomGenerator,
         }
     }
 }
 
-impl<P, V> InteractiveProof<P, V> {
-    pub fn with_prover<NewProver>(self, prover: NewProver) -> InteractiveProof<NewProver, V> {
+impl<P, V, R> InteractiveProof<P, V, R> {
+    pub fn with_prover<NewProver>(self, prover: NewProver) -> InteractiveProof<NewProver, V, R> {
         InteractiveProof {
             prover,
             verifier: self.verifier,
+            random_generator: self.random_generator,
         }
     }
     pub fn with_verifier<NewVerifier>(
         self,
         verifier: NewVerifier,
-    ) -> InteractiveProof<P, NewVerifier> {
+    ) -> InteractiveProof<P, NewVerifier, R> {
         InteractiveProof {
             prover: self.prover,
             verifier,
+            random_generator: self.random_generator,
+        }
+    }
+    pub fn with_random_generator<NewRandomGenerator>(
+        self,
+        random_generator: NewRandomGenerator,
+    ) -> InteractiveProof<P, V, NewRandomGenerator> {
+        InteractiveProof {
+            prover: self.prover,
+            verifier: self.verifier,
+            random_generator,
         }
     }
 }
 
-impl<P, V> InteractiveProof<P, V>
+impl<P, V, R> InteractiveProof<P, V, R>
 where
     P: Prover,
-    V: Verifier<Message = P::Message, Challenge = P::Challenge>,
+    V: Verifier<R, Message = P::Message, Challenge = P::Challenge>,
+    R: RandomGenerator<Message = P::Message>,
 {
     /// Execute proof and verify at the same time
     pub fn create_proof(mut self) -> Vec<P::Message> {
@@ -81,31 +108,42 @@ where
         let mut msg = self.prover.init();
         let mut status = ProofStatus::WaitingChallenge;
         loop {
+            self.random_generator.update_script(&msg);
             let challenge = match status {
-                ProofStatus::Final => match self.verifier.handle_full(&msg, status) {
-                    VerificationStatus::Accept => {
-                        proof.push(msg);
-                        break;
+                ProofStatus::Final => {
+                    match self
+                        .verifier
+                        .handle_full(&msg, &mut self.random_generator, status)
+                    {
+                        VerificationStatus::Accept => {
+                            proof.push(msg);
+                            break;
+                        }
+                        VerificationStatus::Reject(_) => {
+                            panic!("Verifier rejected while prover was waiting for challenge")
+                        }
+                        VerificationStatus::Challenge(_) => {
+                            panic!("Verifier rejected while prover was waiting for challenge")
+                        }
                     }
-                    VerificationStatus::Reject(_) => {
-                        panic!("Verifier rejected while prover was waiting for challenge")
+                }
+                ProofStatus::WaitingChallenge => {
+                    match self
+                        .verifier
+                        .handle_full(&msg, &mut self.random_generator, status)
+                    {
+                        VerificationStatus::Accept => {
+                            panic!("Verifier accepted while prover was waiting for challenge")
+                        }
+                        VerificationStatus::Reject(_) => {
+                            panic!("Verifier rejected while prover was waiting for challenge")
+                        }
+                        VerificationStatus::Challenge(challenge) => {
+                            proof.push(msg);
+                            challenge
+                        }
                     }
-                    VerificationStatus::Challenge(_) => {
-                        panic!("Verifier rejected while prover was waiting for challenge")
-                    }
-                },
-                ProofStatus::WaitingChallenge => match self.verifier.handle_full(&msg, status) {
-                    VerificationStatus::Accept => {
-                        panic!("Verifier accepted while prover was waiting for challenge")
-                    }
-                    VerificationStatus::Reject(_) => {
-                        panic!("Verifier rejected while prover was waiting for challenge")
-                    }
-                    VerificationStatus::Challenge(challenge) => {
-                        proof.push(msg);
-                        challenge
-                    }
-                },
+                }
             };
             let (new_msg, new_status) = self.prover.handle(&challenge);
             msg = new_msg;
@@ -116,16 +154,19 @@ where
     }
 }
 
-impl<P, V> InteractiveProof<P, V>
+impl<P, V, R> InteractiveProof<P, V, R>
 where
-    V: Verifier,
+    V: Verifier<R>,
+    R: RandomGenerator<Message = V::Message>,
 {
     /// Verify if a given proof is true
     pub fn verify(mut self, proof: Vec<V::Message>) -> bool {
         let mut iter = proof.iter().peekable();
         while let Some(msg) = iter.next() {
+            self.random_generator.update_script(msg);
             match self.verifier.handle_full(
                 &msg,
+                &mut self.random_generator,
                 if iter.peek().is_some() {
                     ProofStatus::WaitingChallenge
                 } else {
@@ -133,7 +174,9 @@ where
                 },
             ) {
                 VerificationStatus::Accept => return true,
-                VerificationStatus::Reject(_) => return false,
+                VerificationStatus::Reject(_) => {
+                    return false;
+                }
                 VerificationStatus::Challenge(_) => {}
             }
         }
@@ -143,42 +186,61 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use ark_poly::{
+        multivariate::{SparseTerm, Term},
+        DenseMVPolynomial, Polynomial,
+    };
 
-    struct SumCheckProver;
+    use crate::{scalar::Fq, sum_poly, FiatShamirGenerator, MultiPoly, Oracle, RandomGenerator};
 
-    impl Prover for SumCheckProver {
-        type Challenge = i32;
+    use super::{
+        sum_check::{SumCheckProver, SumCheckVerifier},
+        *,
+    };
 
-        type Message = i32;
-
-        fn init(&mut self) -> Self::Message {
-            todo!()
-        }
-
-        fn handle(&mut self, msg: &Self::Challenge) -> (Self::Message, ProofStatus) {
-            todo!()
-        }
-    }
-    struct SumCheckVerifier;
-    impl Verifier for SumCheckVerifier {
-        type Challenge = i32;
-
-        type Message = i32;
-
-        fn handle(&mut self, msg: &Self::Message) -> VerificationStatus<Self::Challenge, ()> {
-            todo!()
-        }
-    }
-
-    #[test]
+    #[test_log::test]
     fn interactive_test() {
+        let polynomial = MultiPoly::from_coefficients_vec(
+            4,
+            vec![
+                (Fq::from(-1), SparseTerm::new(vec![(0, 1), (1, 1), (2, 1)])),
+                (Fq::from(-1), SparseTerm::new(vec![(0, 1), (1, 1), (3, 1)])),
+                (
+                    Fq::from(1),
+                    SparseTerm::new(vec![(0, 1), (1, 1), (2, 1), (3, 1)]),
+                ),
+                (Fq::from(1), SparseTerm::new(vec![(1, 1), (2, 1)])),
+                (Fq::from(1), SparseTerm::new(vec![(1, 1), (3, 1)])),
+                (Fq::from(-1), SparseTerm::new(vec![(1, 1), (2, 1), (3, 1)])),
+            ],
+        );
+        let h = sum_poly(&polynomial);
+
+        let polynomial_num_vars = polynomial.num_vars();
+        let polynomial_degree = polynomial.degree();
+        let oracle = Oracle::new(polynomial.clone());
+
         let protocol = InteractiveProof::new()
-            .with_prover(SumCheckProver)
-            .with_verifier(SumCheckVerifier);
+            .with_prover(SumCheckProver::new(polynomial.clone()))
+            .with_verifier(SumCheckVerifier::new(
+                polynomial_degree,
+                polynomial_num_vars,
+                oracle,
+                h,
+            ))
+            .with_random_generator(FiatShamirGenerator::default());
         let proof = protocol.create_proof();
 
-        let protocol = InteractiveProof::new().with_verifier(SumCheckVerifier);
+        let oracle = Oracle::new(polynomial.clone());
+        let protocol = InteractiveProof::new()
+            .with_verifier(SumCheckVerifier::new(
+                polynomial_degree,
+                polynomial_num_vars,
+                oracle,
+                h,
+            ))
+            .with_random_generator(FiatShamirGenerator::default());
         let verify_result = protocol.verify(proof);
+        assert!(verify_result);
     }
 }
